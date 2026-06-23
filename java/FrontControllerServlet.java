@@ -1,14 +1,17 @@
+package com.app.annotations;
 import com.app.annotations.Controller;
+import com.app.annotations.URLMapping;
 import jakarta.servlet.*;
 import jakarta.servlet.http.*;
 import java.io.*;
 import java.net.URL;
 import java.util.*;
+import java.lang.reflect.Method;
 
 public class FrontControllerServlet extends HttpServlet {
     
     private List<String> nomsClasses = new ArrayList<>();
-    
+    Map<String, Method> mapMethodes = new HashMap<>();    
     @Override
     public void init() throws ServletException {
         try {
@@ -34,12 +37,19 @@ public class FrontControllerServlet extends HttpServlet {
                                 
                                 if (clazz.isAnnotationPresent(Controller.class)) {
                                     nomsClasses.add(clazz.getSimpleName());
+                                    for (Method method : clazz.getDeclaredMethods()) {
+                                        if (method.isAnnotationPresent(URLMapping.class)) {
+                                            String urlMapping = method.getAnnotation(URLMapping.class).value();
+                                            mapMethodes.put(urlMapping, method);
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+         
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -58,30 +68,48 @@ public class FrontControllerServlet extends HttpServlet {
     }
     
     protected void processRequest(HttpServletRequest request, HttpServletResponse response) 
-            throws ServletException, IOException {
+        throws ServletException, IOException {
+    
+    response.setContentType("text/html;charset=UTF-8");
+    PrintWriter out = response.getWriter();
+    
+
+    String urlDemandee = request.getPathInfo();
+    
+    out.println("<html>");
+    out.println("<body>");
+
+   
+    if (urlDemandee != null && mapMethodes.containsKey(urlDemandee)) {
         
-        response.setContentType("text/html;charset=UTF-8");
-        PrintWriter out = response.getWriter();
+        Method methodeCible = mapMethodes.get(urlDemandee);
+        Class<?> classeParente = methodeCible.getDeclaringClass();
         
-        out.println("<html>");
-        out.println("<head><title>Front Controller</title></head>");
-        out.println("<body>");
-        out.println("<h1>Front Controller</h1>");
-       
-        out.println("<h2>Classes avec @Controller :</h2>");
-        out.println("<ul>");
+        out.println("Classe : " + classeParente.getSimpleName() + "<br>");
+        out.println("Methode : " + methodeCible.getName() + "()");
         
-        if (nomsClasses.isEmpty()) {
-            out.println("<li>Aucune classe avec @Controller</li>");
-        } else {
-            for (String nom : nomsClasses) {
-                out.println("<li>" + nom + "</li>");
-            }
+        try {
+            Object instanceControleur = classeParente.getDeclaredConstructor().newInstance();
+            methodeCible.invoke(instanceControleur);
+        } catch (Exception e) {
+          
         }
-        
-        out.println("</ul>");
-        out.println("<p>Total: " + nomsClasses.size() + " classe(s)</p>");
-        out.println("</body>");
-        out.println("</html>");
-    }
+
+    }else {
+        out.println("classe et methode disponible : <br>");
+    
+        for (String urlKey : mapMethodes.keySet()) {
+            
+            
+            Method methode = mapMethodes.get(urlKey);
+            Class<?> classeParente = methode.getDeclaringClass();
+            
+            out.println("Classe : " + classeParente.getSimpleName() + " / ");
+            out.println("Methode : " + methode.getName() + "()<br>");
+        }
+    
+    out.println("</body>");
+    out.println("</html>");
+}
+}
 }
