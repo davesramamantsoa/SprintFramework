@@ -2,8 +2,17 @@ package mg.itu.Servlet;
 
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.lang.reflect.Array;
 import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -78,25 +87,31 @@ public class FrontControllerServlet extends HttpServlet {
                 Object result = null;
                 Method method = null;
 
-                // Recuperer la methode (avec ou sans req/resp)
+                // === 1. Recuperer la methode et construire les arguments (binding) ===
                 try {
                     method = clazz.getMethod(info.methodName, HttpServletRequest.class,
                             HttpServletResponse.class);
                     result = method.invoke(instance, req, resp);
                 } catch (NoSuchMethodException e) {
-                    method = clazz.getMethod(info.methodName);
-                    result = method.invoke(instance);
+                    for (Method m : clazz.getMethods()) {
+                        if (!m.getName().equals(info.methodName)) continue;
+                        method = m;
+                        break;
+                    }
+                    if (method == null) throw new NoSuchMethodException(info.methodName);
+
+                    Object[] args = buildArgs(method, req, resp);
+                    result = method.invoke(instance, args);
                 }
 
-                // === Verification de l'annotation @RestApi par reflexion ===
+                // === 2. Verification de l'annotation @RestApi par reflexion ===
                 boolean isRestApi = false;
                 if (method != null && method.isAnnotationPresent(RestApi.class)) {
                     isRestApi = true;
                 }
 
-                // === Choix : JSON (RestApi) ou HTML (vue) ===
+                // === 3. Choix : JSON (RestApi) ou HTML (vue) ===
                 if (isRestApi) {
-                    // Retour JSON via PrintWriter
                     resp.setContentType("application/json");
                     resp.setCharacterEncoding("UTF-8");
                     PrintWriter out = resp.getWriter();
@@ -106,14 +121,12 @@ public class FrontControllerServlet extends HttpServlet {
                     } else if (result instanceof String) {
                         out.println(result.toString());
                     } else {
-                        // Conversion simple en JSON pour les types basiques
                         out.println(convertToJson(result));
                     }
                     out.flush();
                     return;
 
                 } else {
-                    // Retour HTML classique (ModelAndView ou String => vue)
                     if (result != null && result instanceof ModelAndView) {
                         ModelAndView mv = (ModelAndView) result;
 
@@ -138,7 +151,6 @@ public class FrontControllerServlet extends HttpServlet {
                         return;
                     }
 
-                    // Affichage par defaut
                     resp.setContentType("text/html");
                     PrintWriter out = resp.getWriter();
                     out.println("<html><body>");
@@ -173,10 +185,139 @@ public class FrontControllerServlet extends HttpServlet {
         }
     }
 
+    // ============================================================
+    // BINDING DES ARGUMENTS (repris du 1er fichier / MethodInfo.buildArgs)
+    // ============================================================
+
     /**
-     * Conversion simple en JSON pour les types basiques.
-     * Pour des objets complexes, utilisez une librairie (Gson, Jackson, etc.)
+     * Construit le tableau d'arguments d'une methode controleur
+     * a partir de la requete HTTP, en se basant sur :
+     *  - le nom du parametre Java (compilation avec -parameters)
+     *  - le type du parametre (primitif, String, Date, enum, tableau, List...)
      */
+    private Object[] buildArgs(Method method, HttpServletRequest req, HttpServletResponse resp) {
+        Parameter[] params = method.getParameters();
+        Object[] args = new Object[params.length];
+
+        for (int i = 0; i < params.length; i++) {
+            Parameter p = params[i];
+            Class<?> type = p.getType();
+
+            // Injection directe
+            if (HttpServletRequest.class.isAssignableFrom(type))  { args[i] = req;  continue; }
+            if (HttpServletResponse.class.isAssignableFrom(type)) { args[i] = resp; continue; }
+
+            String name = p.getName();
+
+            // Tableau
+            if (type.isArray()) {
+                String[] vals = req.getParameterValues(name);
+                if (vals == null) { args[i] = null; continue; }
+                Object arr = Array.newInstance(type.getComponentType(), vals.length);
+                for (int j = 0; j < vals.length; j++) {
+                    Array.set(arr, j, convert(type.getComponentType(), vals[j]));
+                }
+                args[i] = arr;
+                continue;
+            }
+
+            // Collection / List
+            if (Collection.class.isAssignableFrom(type)) {
+                Class<?> elemType = String.class;
+                Type generic = p.getParameterizedType();
+                if (generic instanceof ParameterizedType) {
+                    Type[] targs = ((ParameterizedType) generic).getActualTypeArguments();
+                    if (targs.length > 0 && targs[0] instanceof Class) {
+                        elemType = (Class<?>) targs[0];
+                    }
+                }
+                String[] vals = req.getParameterValues(name);
+                List<Object> list = new ArrayList<>();
+                if (vals != null) {
+                    for (String v : vals) list.add(convert(elemType, v));
+                }
+                if (type == List.class || type.isAssignableFrom(List.class)) {
+                    args[i] = list;
+                } else {
+                    try {
+                        @SuppressWarnings("unchecked")
+                        Collection<Object> coll = (Collection<Object>)
+                                type.getDeclaredConstructor().newInstance();
+                        coll.addAll(list);
+                        args[i] = coll;
+                    } catch (Exception e) {
+                        args[i] = list;
+                    }
+                }
+                continue;
+            }
+
+            // Type simple
+            if (isSimpleType(type)) {
+                String val = req.getParameter(name);
+                args[i] = val == null ? defaultFor(type) : convert(type, val);
+                continue;
+            }
+
+            // Fallback
+            args[i] = req.getParameter(name);
+        }
+        return args;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object convert(Class<?> type, String value) {
+        if (value == null) return defaultFor(type);
+        if (type == String.class) return value;
+
+        if (type == int.class     || type == Integer.class) return Integer.parseInt(value);
+        if (type == long.class    || type == Long.class)    return Long.parseLong(value);
+        if (type == double.class  || type == Double.class)  return Double.parseDouble(value);
+        if (type == float.class   || type == Float.class)   return Float.parseFloat(value);
+        if (type == boolean.class || type == Boolean.class) return Boolean.parseBoolean(value);
+        if (type == byte.class    || type == Byte.class)    return Byte.parseByte(value);
+        if (type == short.class   || type == Short.class)   return Short.parseShort(value);
+        if (type == char.class    || type == Character.class)
+            return value.isEmpty() ? '\0' : value.charAt(0);
+
+        if (type == LocalDate.class)     return LocalDate.parse(value);
+        if (type == LocalDateTime.class) return LocalDateTime.parse(value);
+
+        if (type.isEnum()) return Enum.valueOf((Class<? extends Enum>) type, value);
+
+        return value;
+    }
+
+    private boolean isSimpleType(Class<?> t) {
+        return t == String.class
+                || t == int.class     || t == Integer.class
+                || t == long.class    || t == Long.class
+                || t == double.class  || t == Double.class
+                || t == float.class   || t == Float.class
+                || t == boolean.class || t == Boolean.class
+                || t == byte.class    || t == Byte.class
+                || t == short.class   || t == Short.class
+                || t == char.class    || t == Character.class
+                || t == LocalDate.class || t == LocalDateTime.class
+                || t.isEnum();
+    }
+
+    private Object defaultFor(Class<?> t) {
+        if (t == int.class)     return 0;
+        if (t == long.class)    return 0L;
+        if (t == double.class)  return 0.0;
+        if (t == float.class)   return 0.0f;
+        if (t == boolean.class) return false;
+        if (t == byte.class)    return (byte) 0;
+        if (t == short.class)   return (short) 0;
+        if (t == char.class)    return '\0';
+        return null;
+    }
+
+    // ============================================================
+    // JSON
+    // ============================================================
+
     private String convertToJson(Object obj) {
         if (obj == null) {
             return "null";
@@ -211,7 +352,6 @@ public class FrontControllerServlet extends HttpServlet {
             sb.append("]");
             return sb.toString();
         }
-        // Fallback : toString entre quotes
         return "\"" + escapeJson(obj.toString()) + "\"";
     }
 
