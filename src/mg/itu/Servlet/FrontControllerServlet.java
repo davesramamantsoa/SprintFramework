@@ -18,15 +18,28 @@ import java.util.Set;
 
 import jakarta.servlet.RequestDispatcher;
 import jakarta.servlet.ServletException;
+import jakarta.servlet.annotation.MultipartConfig;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.Part;
+
+import mg.itu.utils.MapFile;
 import mg.itu.utils.MethodInfo;
 import mg.itu.utils.ModelAndView;
 import mg.itu.utils.UrlMethod;
 import mg.itu.listener.AppListener;
 import mg.itu.annotation.RestApi.RestApi;
 
+/**
+ * MultipartConfig : indispensable pour que req.getPart(...) fonctionne,
+ * quelle que soit l'extension du fichier envoye (pdf, docx, zip, jpg, mp4...).
+ */
+@MultipartConfig(
+        fileSizeThreshold = 1024 * 1024,       // 1 MB en memoire, au-dela -> disque
+        maxFileSize       = 50L * 1024 * 1024, // 50 MB par fichier
+        maxRequestSize    = 100L * 1024 * 1024 // 100 MB par requete
+)
 public class FrontControllerServlet extends HttpServlet {
 
     private static Set<String> uris = new HashSet<>();
@@ -186,16 +199,21 @@ public class FrontControllerServlet extends HttpServlet {
     }
 
     // ============================================================
-    // BINDING DES ARGUMENTS (repris du 1er fichier / MethodInfo.buildArgs)
+    // BINDING DES ARGUMENTS (avec support MapFile / upload)
     // ============================================================
 
     /**
-     * Construit le tableau d'arguments d'une methode controleur
-     * a partir de la requete HTTP, en se basant sur :
-     *  - le nom du parametre Java (compilation avec -parameters)
-     *  - le type du parametre (primitif, String, Date, enum, tableau, List...)
+     * Construit le tableau d'arguments d'une methode controleur.
+     * Supporte :
+     *  - HttpServletRequest / HttpServletResponse (injectes)
+     *  - primitifs, wrappers, String, LocalDate, LocalDateTime, enum
+     *  - tableaux (T[])
+     *  - collections (List<T>, Set<T>...)
+     *  - MapFile (fichier multipart) / List<MapFile> / MapFile[]
      */
-    private Object[] buildArgs(Method method, HttpServletRequest req, HttpServletResponse resp) {
+    private Object[] buildArgs(Method method, HttpServletRequest req, HttpServletResponse resp)
+            throws Exception {
+
         Parameter[] params = method.getParameters();
         Object[] args = new Object[params.length];
 
@@ -209,19 +227,13 @@ public class FrontControllerServlet extends HttpServlet {
 
             String name = p.getName();
 
-            // Tableau
-            if (type.isArray()) {
-                String[] vals = req.getParameterValues(name);
-                if (vals == null) { args[i] = null; continue; }
-                Object arr = Array.newInstance(type.getComponentType(), vals.length);
-                for (int j = 0; j < vals.length; j++) {
-                    Array.set(arr, j, convert(type.getComponentType(), vals[j]));
-                }
-                args[i] = arr;
+            // === UPLOAD simple : MapFile ===
+            if (MapFile.class.isAssignableFrom(type)) {
+                args[i] = readMapFile(req, name);
                 continue;
             }
 
-            // Collection / List
+            // === Collection (List/Set) ===
             if (Collection.class.isAssignableFrom(type)) {
                 Class<?> elemType = String.class;
                 Type generic = p.getParameterizedType();
@@ -231,6 +243,21 @@ public class FrontControllerServlet extends HttpServlet {
                         elemType = (Class<?>) targs[0];
                     }
                 }
+
+                // List<MapFile> : multi-upload
+                if (MapFile.class.isAssignableFrom(elemType)) {
+                    List<Object> files = new ArrayList<>();
+                    for (Part part : req.getParts()) {
+                        if (part.getName().equals(name) && part.getSize() > 0) {
+                            MapFile mf = MapFile.fromPart(part);
+                            if (mf != null) files.add(mf);
+                        }
+                    }
+                    args[i] = files;
+                    continue;
+                }
+
+                // Collection classique
                 String[] vals = req.getParameterValues(name);
                 List<Object> list = new ArrayList<>();
                 if (vals != null) {
@@ -252,7 +279,34 @@ public class FrontControllerServlet extends HttpServlet {
                 continue;
             }
 
-            // Type simple
+            // === Tableau ===
+            if (type.isArray()) {
+                // MapFile[] : multi-upload
+                if (MapFile.class.isAssignableFrom(type.getComponentType())) {
+                    List<Object> files = new ArrayList<>();
+                    for (Part part : req.getParts()) {
+                        if (part.getName().equals(name) && part.getSize() > 0) {
+                            MapFile mf = MapFile.fromPart(part);
+                            if (mf != null) files.add(mf);
+                        }
+                    }
+                    Object arr = Array.newInstance(type.getComponentType(), files.size());
+                    for (int j = 0; j < files.size(); j++) Array.set(arr, j, files.get(j));
+                    args[i] = arr;
+                    continue;
+                }
+
+                String[] vals = req.getParameterValues(name);
+                if (vals == null) { args[i] = null; continue; }
+                Object arr = Array.newInstance(type.getComponentType(), vals.length);
+                for (int j = 0; j < vals.length; j++) {
+                    Array.set(arr, j, convert(type.getComponentType(), vals[j]));
+                }
+                args[i] = arr;
+                continue;
+            }
+
+            // === Type simple ===
             if (isSimpleType(type)) {
                 String val = req.getParameter(name);
                 args[i] = val == null ? defaultFor(type) : convert(type, val);
@@ -263,6 +317,19 @@ public class FrontControllerServlet extends HttpServlet {
             args[i] = req.getParameter(name);
         }
         return args;
+    }
+
+    /**
+     * Recupere un fichier uploade depuis la requete multipart sous forme de MapFile.
+     * Retourne null si aucun fichier (ou fichier vide).
+     */
+    private MapFile readMapFile(HttpServletRequest req, String fieldName) throws Exception {
+        String contentType = req.getContentType();
+        if (contentType == null || !contentType.toLowerCase().startsWith("multipart/")) {
+            return null;
+        }
+        Part part = req.getPart(fieldName);
+        return MapFile.fromPart(part);
     }
 
     @SuppressWarnings("unchecked")
@@ -315,19 +382,24 @@ public class FrontControllerServlet extends HttpServlet {
     }
 
     // ============================================================
-    // JSON
+    // JSON (avec support MapFile)
     // ============================================================
 
     private String convertToJson(Object obj) {
-        if (obj == null) {
-            return "null";
+        if (obj == null) return "null";
+
+        // MapFile -> JSON descriptif
+        if (obj instanceof MapFile) {
+            MapFile f = (MapFile) obj;
+            return "{\"fileName\":\"" + escapeJson(f.getFileName()) + "\","
+                 + "\"extension\":\"" + escapeJson(f.getExtension()) + "\","
+                 + "\"size\":" + (f.getBytes() == null ? 0 : f.getBytes().length) + ","
+                 + "\"encodedFileName\":\"" + escapeJson(f.getEncodedFileName()) + "\"}";
         }
-        if (obj instanceof Number || obj instanceof Boolean) {
-            return obj.toString();
-        }
-        if (obj instanceof String) {
-            return "\"" + escapeJson(obj.toString()) + "\"";
-        }
+
+        if (obj instanceof Number || obj instanceof Boolean) return obj.toString();
+        if (obj instanceof String) return "\"" + escapeJson(obj.toString()) + "\"";
+
         if (obj instanceof Map) {
             StringBuilder sb = new StringBuilder("{");
             Map<?, ?> map = (Map<?, ?>) obj;
@@ -341,6 +413,7 @@ public class FrontControllerServlet extends HttpServlet {
             sb.append("}");
             return sb.toString();
         }
+
         if (obj instanceof Iterable) {
             StringBuilder sb = new StringBuilder("[");
             boolean first = true;
@@ -352,6 +425,7 @@ public class FrontControllerServlet extends HttpServlet {
             sb.append("]");
             return sb.toString();
         }
+
         return "\"" + escapeJson(obj.toString()) + "\"";
     }
 
