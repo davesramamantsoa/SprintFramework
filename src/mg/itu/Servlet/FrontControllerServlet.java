@@ -22,11 +22,13 @@ import jakarta.servlet.annotation.MultipartConfig;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpSession;
 import jakarta.servlet.http.Part;
 
 import mg.itu.utils.MapFile;
 import mg.itu.utils.MethodInfo;
 import mg.itu.utils.ModelAndView;
+import mg.itu.utils.Session;
 import mg.itu.utils.UrlMethod;
 import mg.itu.listener.AppListener;
 import mg.itu.annotation.RestApi.RestApi;
@@ -99,6 +101,7 @@ public class FrontControllerServlet extends HttpServlet {
 
                 Object result = null;
                 Method method = null;
+                Object[] args = null;
 
                 // === 1. Recuperer la methode et construire les arguments (binding) ===
                 try {
@@ -113,8 +116,17 @@ public class FrontControllerServlet extends HttpServlet {
                     }
                     if (method == null) throw new NoSuchMethodException(info.methodName);
 
-                    Object[] args = buildArgs(method, req, resp);
+                    args = buildArgs(method, req, resp);
                     result = method.invoke(instance, args);
+                }
+
+                // === 1bis. Commit de la Session si un argument Session a ete utilise ===
+                if (args != null) {
+                    for (Object arg : args) {
+                        if (arg instanceof Session) {
+                            ((Session) arg).commit(req.getSession());
+                        }
+                    }
                 }
 
                 // === 2. Verification de l'annotation @RestApi par reflexion ===
@@ -143,6 +155,7 @@ public class FrontControllerServlet extends HttpServlet {
                     if (result != null && result instanceof ModelAndView) {
                         ModelAndView mv = (ModelAndView) result;
 
+                        // Possibilite de passer la Session dans la vue via mv.addObject("session", session)
                         if (mv.getData() != null) {
                             for (Map.Entry<String, Object> entry : mv.getData().entrySet()) {
                                 req.setAttribute(entry.getKey(), entry.getValue());
@@ -199,13 +212,14 @@ public class FrontControllerServlet extends HttpServlet {
     }
 
     // ============================================================
-    // BINDING DES ARGUMENTS (avec support MapFile / upload)
+    // BINDING DES ARGUMENTS (avec support MapFile / upload / Session)
     // ============================================================
 
     /**
      * Construit le tableau d'arguments d'une methode controleur.
      * Supporte :
      *  - HttpServletRequest / HttpServletResponse (injectes)
+     *  - Session (chargee depuis la HttpSession)
      *  - primitifs, wrappers, String, LocalDate, LocalDateTime, enum
      *  - tableaux (T[])
      *  - collections (List<T>, Set<T>...)
@@ -224,6 +238,14 @@ public class FrontControllerServlet extends HttpServlet {
             // Injection directe
             if (HttpServletRequest.class.isAssignableFrom(type))  { args[i] = req;  continue; }
             if (HttpServletResponse.class.isAssignableFrom(type)) { args[i] = resp; continue; }
+
+            // === SESSION ===
+            if (Session.class.isAssignableFrom(type)) {
+                Session session = new Session();
+                session.load(req.getSession()); // charge les attributs depuis la HttpSession
+                args[i] = session;
+                continue;
+            }
 
             String name = p.getName();
 
