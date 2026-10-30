@@ -25,6 +25,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpSession;
 import jakarta.servlet.http.Part;
 
+import mg.itu.annotation.Security.RequireLogin;
 import mg.itu.utils.MapFile;
 import mg.itu.utils.MethodInfo;
 import mg.itu.utils.ModelAndView;
@@ -33,10 +34,7 @@ import mg.itu.utils.UrlMethod;
 import mg.itu.listener.AppListener;
 import mg.itu.annotation.RestApi.RestApi;
 
-/**
- * MultipartConfig : indispensable pour que req.getPart(...) fonctionne,
- * quelle que soit l'extension du fichier envoye (pdf, docx, zip, jpg, mp4...).
- */
+
 @MultipartConfig(
         fileSizeThreshold = 1024 * 1024,       // 1 MB en memoire, au-dela -> disque
         maxFileSize       = 50L * 1024 * 1024, // 50 MB par fichier
@@ -103,24 +101,54 @@ public class FrontControllerServlet extends HttpServlet {
                 Method method = null;
                 Object[] args = null;
 
-                // === 1. Recuperer la methode et construire les arguments (binding) ===
+             
                 try {
                     method = clazz.getMethod(info.methodName, HttpServletRequest.class,
                             HttpServletResponse.class);
-                    result = method.invoke(instance, req, resp);
                 } catch (NoSuchMethodException e) {
                     for (Method m : clazz.getMethods()) {
                         if (!m.getName().equals(info.methodName)) continue;
                         method = m;
                         break;
                     }
-                    if (method == null) throw new NoSuchMethodException(info.methodName);
+                }
+                if (method == null) throw new NoSuchMethodException(info.methodName);
 
+                
+                if (method.isAnnotationPresent(RequireLogin.class)) {
+                    RequireLogin ann = method.getAnnotation(RequireLogin.class);
+
+                    HttpSession hs = req.getSession(false);
+                    Object user = (hs != null)
+                            ? hs.getAttribute(AppListener.sessionUserAttribute)
+                            : null;
+
+                    // 2.a — non connecte
+                    if (user == null) {
+                        forbidden(resp, "Vous devez etre connecte.");
+                        return;
+                    }
+
+                    // 2.b — role exige ?
+                    if (!ann.role().isEmpty() && !MethodInfo.hasRole(user, ann.role())) {
+                        forbidden(resp,
+                                "Role insuffisant. Requis : " + ann.role()
+                                        + " (vous : " + MethodInfo.resolveUserRole(user) + ")");
+                        return;
+                    }
+                }
+
+                // === 3. Invocation avec binding ===
+                if (method.getParameterCount() == 2
+                        && method.getParameterTypes()[0] == HttpServletRequest.class
+                        && method.getParameterTypes()[1] == HttpServletResponse.class) {
+                    result = method.invoke(instance, req, resp);
+                } else {
                     args = buildArgs(method, req, resp);
                     result = method.invoke(instance, args);
                 }
 
-                // === 1bis. Commit de la Session si un argument Session a ete utilise ===
+                // === 3bis. Commit de la Session si un argument Session a ete utilise ===
                 if (args != null) {
                     for (Object arg : args) {
                         if (arg instanceof Session) {
@@ -129,13 +157,10 @@ public class FrontControllerServlet extends HttpServlet {
                     }
                 }
 
-                // === 2. Verification de l'annotation @RestApi par reflexion ===
-                boolean isRestApi = false;
-                if (method != null && method.isAnnotationPresent(RestApi.class)) {
-                    isRestApi = true;
-                }
+                // === 4. Verification de l'annotation @RestApi ===
+                boolean isRestApi = method.isAnnotationPresent(RestApi.class);
 
-                // === 3. Choix : JSON (RestApi) ou HTML (vue) ===
+                // === 5. Choix : JSON (RestApi) ou HTML (vue) ===
                 if (isRestApi) {
                     resp.setContentType("application/json");
                     resp.setCharacterEncoding("UTF-8");
@@ -155,7 +180,6 @@ public class FrontControllerServlet extends HttpServlet {
                     if (result != null && result instanceof ModelAndView) {
                         ModelAndView mv = (ModelAndView) result;
 
-                        // Possibilite de passer la Session dans la vue via mv.addObject("session", session)
                         if (mv.getData() != null) {
                             for (Map.Entry<String, Object> entry : mv.getData().entrySet()) {
                                 req.setAttribute(entry.getKey(), entry.getValue());
@@ -211,20 +235,7 @@ public class FrontControllerServlet extends HttpServlet {
         }
     }
 
-    // ============================================================
-    // BINDING DES ARGUMENTS (avec support MapFile / upload / Session)
-    // ============================================================
-
-    /**
-     * Construit le tableau d'arguments d'une methode controleur.
-     * Supporte :
-     *  - HttpServletRequest / HttpServletResponse (injectes)
-     *  - Session (chargee depuis la HttpSession)
-     *  - primitifs, wrappers, String, LocalDate, LocalDateTime, enum
-     *  - tableaux (T[])
-     *  - collections (List<T>, Set<T>...)
-     *  - MapFile (fichier multipart) / List<MapFile> / MapFile[]
-     */
+  
     private Object[] buildArgs(Method method, HttpServletRequest req, HttpServletResponse resp)
             throws Exception {
 
@@ -242,7 +253,7 @@ public class FrontControllerServlet extends HttpServlet {
             // === SESSION ===
             if (Session.class.isAssignableFrom(type)) {
                 Session session = new Session();
-                session.load(req.getSession()); // charge les attributs depuis la HttpSession
+                session.load(req.getSession());
                 args[i] = session;
                 continue;
             }
@@ -266,6 +277,7 @@ public class FrontControllerServlet extends HttpServlet {
                     }
                 }
 
+                // === MapFile ===
                 // List<MapFile> : multi-upload
                 if (MapFile.class.isAssignableFrom(elemType)) {
                     List<Object> files = new ArrayList<>();
@@ -403,6 +415,13 @@ public class FrontControllerServlet extends HttpServlet {
         return null;
     }
 
+    private void forbidden(HttpServletResponse resp, String message) throws IOException {
+        resp.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        resp.setContentType("text/html");
+        PrintWriter out = resp.getWriter();
+        out.println("<html><body><h1>403 - Acces refuse</h1><p>" + message + "</p></body></html>");
+    }
+
     // ============================================================
     // JSON (avec support MapFile)
     // ============================================================
@@ -410,7 +429,6 @@ public class FrontControllerServlet extends HttpServlet {
     private String convertToJson(Object obj) {
         if (obj == null) return "null";
 
-        // MapFile -> JSON descriptif
         if (obj instanceof MapFile) {
             MapFile f = (MapFile) obj;
             return "{\"fileName\":\"" + escapeJson(f.getFileName()) + "\","
