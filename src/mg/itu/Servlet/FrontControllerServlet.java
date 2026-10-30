@@ -25,6 +25,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpSession;
 import jakarta.servlet.http.Part;
 
+import mg.itu.annotation.Security.RequireLogin;
 import mg.itu.utils.MapFile;
 import mg.itu.utils.MethodInfo;
 import mg.itu.utils.ModelAndView;
@@ -103,24 +104,50 @@ public class FrontControllerServlet extends HttpServlet {
                 Method method = null;
                 Object[] args = null;
 
-                // === 1. Recuperer la methode et construire les arguments (binding) ===
+                // === 1. Recuperer la methode (avec ou sans req/resp) ===
                 try {
                     method = clazz.getMethod(info.methodName, HttpServletRequest.class,
                             HttpServletResponse.class);
-                    result = method.invoke(instance, req, resp);
                 } catch (NoSuchMethodException e) {
                     for (Method m : clazz.getMethods()) {
                         if (!m.getName().equals(info.methodName)) continue;
                         method = m;
                         break;
                     }
-                    if (method == null) throw new NoSuchMethodException(info.methodName);
+                }
+                if (method == null) throw new NoSuchMethodException(info.methodName);
 
+                // === 2. Controle d'acces : @RequireLogin (method-level) ===
+                if (method.isAnnotationPresent(RequireLogin.class)) {
+                    RequireLogin ann = method.getAnnotation(RequireLogin.class);
+
+                    HttpSession hs = req.getSession(false);
+                    Object user = (hs != null)
+                            ? hs.getAttribute(AppListener.sessionUserAttribute)
+                            : null;
+
+                    if (user == null) {
+                        forbidden(resp, "Vous devez etre connecte.");
+                        return;
+                    }
+
+                    if (!ann.role().isEmpty() && !MethodInfo.hasRole(user, ann.role())) {
+                        forbidden(resp, "Role insuffisant.");
+                        return;
+                    }
+                }
+
+                // === 3. Invocation avec binding ===
+                if (method.getParameterCount() == 2
+                        && method.getParameterTypes()[0] == HttpServletRequest.class
+                        && method.getParameterTypes()[1] == HttpServletResponse.class) {
+                    result = method.invoke(instance, req, resp);
+                } else {
                     args = buildArgs(method, req, resp);
                     result = method.invoke(instance, args);
                 }
 
-                // === 1bis. Commit de la Session si un argument Session a ete utilise ===
+                // === 3bis. Commit de la Session ===
                 if (args != null) {
                     for (Object arg : args) {
                         if (arg instanceof Session) {
@@ -129,13 +156,10 @@ public class FrontControllerServlet extends HttpServlet {
                     }
                 }
 
-                // === 2. Verification de l'annotation @RestApi par reflexion ===
-                boolean isRestApi = false;
-                if (method != null && method.isAnnotationPresent(RestApi.class)) {
-                    isRestApi = true;
-                }
+                // === 4. @RestApi ? ===
+                boolean isRestApi = method.isAnnotationPresent(RestApi.class);
 
-                // === 3. Choix : JSON (RestApi) ou HTML (vue) ===
+                // === 5. JSON ou HTML ===
                 if (isRestApi) {
                     resp.setContentType("application/json");
                     resp.setCharacterEncoding("UTF-8");
@@ -155,7 +179,6 @@ public class FrontControllerServlet extends HttpServlet {
                     if (result != null && result instanceof ModelAndView) {
                         ModelAndView mv = (ModelAndView) result;
 
-                        // Possibilite de passer la Session dans la vue via mv.addObject("session", session)
                         if (mv.getData() != null) {
                             for (Map.Entry<String, Object> entry : mv.getData().entrySet()) {
                                 req.setAttribute(entry.getKey(), entry.getValue());
@@ -212,19 +235,9 @@ public class FrontControllerServlet extends HttpServlet {
     }
 
     // ============================================================
-    // BINDING DES ARGUMENTS (avec support MapFile / upload / Session)
+    // BINDING DES ARGUMENTS
     // ============================================================
 
-    /**
-     * Construit le tableau d'arguments d'une methode controleur.
-     * Supporte :
-     *  - HttpServletRequest / HttpServletResponse (injectes)
-     *  - Session (chargee depuis la HttpSession)
-     *  - primitifs, wrappers, String, LocalDate, LocalDateTime, enum
-     *  - tableaux (T[])
-     *  - collections (List<T>, Set<T>...)
-     *  - MapFile (fichier multipart) / List<MapFile> / MapFile[]
-     */
     private Object[] buildArgs(Method method, HttpServletRequest req, HttpServletResponse resp)
             throws Exception {
 
@@ -242,7 +255,7 @@ public class FrontControllerServlet extends HttpServlet {
             // === SESSION ===
             if (Session.class.isAssignableFrom(type)) {
                 Session session = new Session();
-                session.load(req.getSession()); // charge les attributs depuis la HttpSession
+                session.load(req.getSession());
                 args[i] = session;
                 continue;
             }
@@ -266,7 +279,6 @@ public class FrontControllerServlet extends HttpServlet {
                     }
                 }
 
-                // List<MapFile> : multi-upload
                 if (MapFile.class.isAssignableFrom(elemType)) {
                     List<Object> files = new ArrayList<>();
                     for (Part part : req.getParts()) {
@@ -279,7 +291,6 @@ public class FrontControllerServlet extends HttpServlet {
                     continue;
                 }
 
-                // Collection classique
                 String[] vals = req.getParameterValues(name);
                 List<Object> list = new ArrayList<>();
                 if (vals != null) {
@@ -303,7 +314,6 @@ public class FrontControllerServlet extends HttpServlet {
 
             // === Tableau ===
             if (type.isArray()) {
-                // MapFile[] : multi-upload
                 if (MapFile.class.isAssignableFrom(type.getComponentType())) {
                     List<Object> files = new ArrayList<>();
                     for (Part part : req.getParts()) {
@@ -335,16 +345,11 @@ public class FrontControllerServlet extends HttpServlet {
                 continue;
             }
 
-            // Fallback
             args[i] = req.getParameter(name);
         }
         return args;
     }
 
-    /**
-     * Recupere un fichier uploade depuis la requete multipart sous forme de MapFile.
-     * Retourne null si aucun fichier (ou fichier vide).
-     */
     private MapFile readMapFile(HttpServletRequest req, String fieldName) throws Exception {
         String contentType = req.getContentType();
         if (contentType == null || !contentType.toLowerCase().startsWith("multipart/")) {
@@ -404,13 +409,23 @@ public class FrontControllerServlet extends HttpServlet {
     }
 
     // ============================================================
-    // JSON (avec support MapFile)
+    // 403
+    // ============================================================
+
+    private void forbidden(HttpServletResponse resp, String message) throws IOException {
+        resp.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        resp.setContentType("text/html");
+        PrintWriter out = resp.getWriter();
+        out.println("<html><body><h1>403 - Acces refuse</h1><p>" + message + "</p></body></html>");
+    }
+
+    // ============================================================
+    // JSON
     // ============================================================
 
     private String convertToJson(Object obj) {
         if (obj == null) return "null";
 
-        // MapFile -> JSON descriptif
         if (obj instanceof MapFile) {
             MapFile f = (MapFile) obj;
             return "{\"fileName\":\"" + escapeJson(f.getFileName()) + "\","
