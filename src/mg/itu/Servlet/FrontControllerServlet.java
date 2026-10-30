@@ -34,10 +34,7 @@ import mg.itu.utils.UrlMethod;
 import mg.itu.listener.AppListener;
 import mg.itu.annotation.RestApi.RestApi;
 
-/**
- * MultipartConfig : indispensable pour que req.getPart(...) fonctionne,
- * quelle que soit l'extension du fichier envoye (pdf, docx, zip, jpg, mp4...).
- */
+
 @MultipartConfig(
         fileSizeThreshold = 1024 * 1024,       // 1 MB en memoire, au-dela -> disque
         maxFileSize       = 50L * 1024 * 1024, // 50 MB par fichier
@@ -104,7 +101,7 @@ public class FrontControllerServlet extends HttpServlet {
                 Method method = null;
                 Object[] args = null;
 
-                // === 1. Recuperer la methode (avec ou sans req/resp) ===
+             
                 try {
                     method = clazz.getMethod(info.methodName, HttpServletRequest.class,
                             HttpServletResponse.class);
@@ -117,7 +114,7 @@ public class FrontControllerServlet extends HttpServlet {
                 }
                 if (method == null) throw new NoSuchMethodException(info.methodName);
 
-                // === 2. Controle d'acces : @RequireLogin (method-level) ===
+                
                 if (method.isAnnotationPresent(RequireLogin.class)) {
                     RequireLogin ann = method.getAnnotation(RequireLogin.class);
 
@@ -126,13 +123,17 @@ public class FrontControllerServlet extends HttpServlet {
                             ? hs.getAttribute(AppListener.sessionUserAttribute)
                             : null;
 
+                    // 2.a — non connecte
                     if (user == null) {
                         forbidden(resp, "Vous devez etre connecte.");
                         return;
                     }
 
+                    // 2.b — role exige ?
                     if (!ann.role().isEmpty() && !MethodInfo.hasRole(user, ann.role())) {
-                        forbidden(resp, "Role insuffisant.");
+                        forbidden(resp,
+                                "Role insuffisant. Requis : " + ann.role()
+                                        + " (vous : " + MethodInfo.resolveUserRole(user) + ")");
                         return;
                     }
                 }
@@ -147,7 +148,7 @@ public class FrontControllerServlet extends HttpServlet {
                     result = method.invoke(instance, args);
                 }
 
-                // === 3bis. Commit de la Session ===
+                // === 3bis. Commit de la Session si un argument Session a ete utilise ===
                 if (args != null) {
                     for (Object arg : args) {
                         if (arg instanceof Session) {
@@ -156,10 +157,10 @@ public class FrontControllerServlet extends HttpServlet {
                     }
                 }
 
-                // === 4. @RestApi ? ===
+                // === 4. Verification de l'annotation @RestApi ===
                 boolean isRestApi = method.isAnnotationPresent(RestApi.class);
 
-                // === 5. JSON ou HTML ===
+                // === 5. Choix : JSON (RestApi) ou HTML (vue) ===
                 if (isRestApi) {
                     resp.setContentType("application/json");
                     resp.setCharacterEncoding("UTF-8");
@@ -234,10 +235,7 @@ public class FrontControllerServlet extends HttpServlet {
         }
     }
 
-    // ============================================================
-    // BINDING DES ARGUMENTS
-    // ============================================================
-
+  
     private Object[] buildArgs(Method method, HttpServletRequest req, HttpServletResponse resp)
             throws Exception {
 
@@ -279,6 +277,8 @@ public class FrontControllerServlet extends HttpServlet {
                     }
                 }
 
+                // === MapFile ===
+                // List<MapFile> : multi-upload
                 if (MapFile.class.isAssignableFrom(elemType)) {
                     List<Object> files = new ArrayList<>();
                     for (Part part : req.getParts()) {
@@ -291,6 +291,7 @@ public class FrontControllerServlet extends HttpServlet {
                     continue;
                 }
 
+                // Collection classique
                 String[] vals = req.getParameterValues(name);
                 List<Object> list = new ArrayList<>();
                 if (vals != null) {
@@ -314,6 +315,7 @@ public class FrontControllerServlet extends HttpServlet {
 
             // === Tableau ===
             if (type.isArray()) {
+                // MapFile[] : multi-upload
                 if (MapFile.class.isAssignableFrom(type.getComponentType())) {
                     List<Object> files = new ArrayList<>();
                     for (Part part : req.getParts()) {
@@ -345,11 +347,16 @@ public class FrontControllerServlet extends HttpServlet {
                 continue;
             }
 
+            // Fallback
             args[i] = req.getParameter(name);
         }
         return args;
     }
 
+    /**
+     * Recupere un fichier uploade depuis la requete multipart sous forme de MapFile.
+     * Retourne null si aucun fichier (ou fichier vide).
+     */
     private MapFile readMapFile(HttpServletRequest req, String fieldName) throws Exception {
         String contentType = req.getContentType();
         if (contentType == null || !contentType.toLowerCase().startsWith("multipart/")) {
@@ -408,10 +415,6 @@ public class FrontControllerServlet extends HttpServlet {
         return null;
     }
 
-    // ============================================================
-    // 403
-    // ============================================================
-
     private void forbidden(HttpServletResponse resp, String message) throws IOException {
         resp.setStatus(HttpServletResponse.SC_FORBIDDEN);
         resp.setContentType("text/html");
@@ -420,7 +423,7 @@ public class FrontControllerServlet extends HttpServlet {
     }
 
     // ============================================================
-    // JSON
+    // JSON (avec support MapFile)
     // ============================================================
 
     private String convertToJson(Object obj) {
